@@ -24,7 +24,7 @@ def top_k(logits, thres = 0.9):
     probs.scatter_(1, ind, val)
     return probs
 
-class TrainingWrapper(nn.Module):
+class TrainingWrapper(nn.Module): # 토치 클래스 상속! 즉 포워드를 봐야겠지 ?
     def __init__(self, net, ignore_index = -100, pad_value = 0):
         super().__init__()
         assert isinstance(net, ReformerLM), 'generative trainer wrapper can only accept ReformerLM class'
@@ -34,6 +34,7 @@ class TrainingWrapper(nn.Module):
         self.net = Autopadder(net)
         self.max_seq_len = net.max_seq_len
 
+    # 벨리데이션 할때 쓸꺼야 - 그라디언트가 필요없다니 자연스러운 추측가능!
     @torch.no_grad()
     def generate(self, start_tokens, seq_len, eos_token = None, temperature = 1., filter_logits_fn = top_k, filter_thres = 0.9, **kwargs):
         was_training = self.net.training
@@ -75,9 +76,11 @@ class TrainingWrapper(nn.Module):
         return out
 
     def forward(self, x, return_loss = False, **kwargs):
+        # partial <- 미리 변수값 몇개를 너주는거야 !
+        # pad_sequence 펑션에 파라미트 batch_first, padding_value 를 디폴밸류 정해준거
         pad = partial(pad_sequence, batch_first = True, padding_value = self.pad_value)
 
-        if not return_loss:
+        if not return_loss: # 로쓰 필요없을때(벨리데이션할때) !
             if not isinstance(x, torch.Tensor):
                 x = pad(x)
             return self.net(x, **kwargs)
@@ -89,7 +92,10 @@ class TrainingWrapper(nn.Module):
             xi = pad(list(map(lambda t: t[:-1], x)))
             xo = pad(list(map(lambda t: t[1:], x)))
 
-        out = self.net(xi, **kwargs)
+        # size = [4, 4096, 256] <- 256 개 다음 캐릭터 후보들!
+        out = self.net(xi, **kwargs) # net = 잘싸논 리포머 전체 !! 인코더 디코더 합쳐져있음 enwiki8에선
 
+        # out.transpose 하면 사이즈를 [4, 256, 4096]
+        # cross_entropy 가 그냥 [batch_size, softmax_size, 나머지...] 요구함
         loss = F.cross_entropy(out.transpose(1, 2), xo, ignore_index = self.ignore_index)
         return loss

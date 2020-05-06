@@ -12,6 +12,7 @@ import torch
 import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+import shutil
 
 def add_argument():
     parser=argparse.ArgumentParser(description='enwik8')
@@ -98,16 +99,37 @@ val_dataset   = TextSamplerDataset(data_val, SEQ_LEN)
 cmd_args = add_argument()
 model_engine, optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=model, model_parameters=model.parameters(),  training_data=train_dataset)
 
+def save_ckp(state, is_best, checkpoint_path, best_model_path):
+    '''
+    :param state: checkpoint we want to save
+    :param is_best: indicator to save the best checkpoint; min valid loss
+    :param checkpoint_path: path to save checkpoint per epoch
+    :param best_model_path:  path to save BEST model param
+    '''
+    torch.save(state, checkpoint_path)
+    if is_best:
+        shutil.copyfile(checkpoint_path, best_model_path)
+
+
+def save_losses_history(train_loss, val_loss):
+    f = open("/home/bizon/param_reformer/losses_history.txt", 'a')
+    f.write(f'train_loss: {train_loss}, val_loss:{val_loss}\n')
+    f.close()
+
+
 # training
+prev_best_loss = float('inf')
+checkpoint_path = "/home/bizon/param_reformer/model0504.pth"
+best_model_path = "/home/bizon/param_reformer/best_model0504.pth"
 
 for _ in range(EPOCHS):
     for i, data in enumerate(trainloader):
         model_engine.train()
         data = data.to(model_engine.local_rank)
-        loss = model_engine(data, return_loss = True)
-        model_engine.backward(loss)
+        train_loss = model_engine(data, return_loss = True)
+        model_engine.backward(train_loss)
         model_engine.step()
-        print(loss.item() * GRADIENT_ACCUMULATE_EVERY)
+        print(train_loss.item() * GRADIENT_ACCUMULATE_EVERY)
 
         if i % VALIDATE_EVERY == 0:
             model.eval()
@@ -115,6 +137,38 @@ for _ in range(EPOCHS):
                 inp = random.choice(val_dataset)[:-1]
                 loss = model(inp[None, :].cuda(), return_loss = True)
                 print(f'validation loss: {loss.item()}')
+
+                # save check point
+                save_ckp(checkpoint, False, checkpoint_path, best_model_path)
+
+                # save the best param !
+                checkpoint = {
+                    'epoch': i,
+                    'valid_loss_min': loss,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optim.state_dict(),
+                    'dim': 512,
+                    'depth': 6,
+                    'max_seq_len': SEQ_LEN,
+                    'num_tokens': 256,
+                    'heads': 8,
+                    'bucket_size': 64,
+                    'n_hashes': 4,
+                    'ff_chunks': 10,
+                    'lsh_dropout': 0.1,
+                    'weight_tie': True,
+                    'causal': True,
+                    'n_local_attn_heads': 4,
+                    'use_full_attn': False,
+                }
+                if prev_best_loss > loss:
+                    # store the param
+                    print('  found lower val.loss!! from {:.6f} -> {:.6f}.'.format(prev_best_loss, loss))
+                    print('  save model...')
+                    save_ckp(checkpoint, True, checkpoint_path, best_model_path)
+                    prev_best_loss = loss
+                # save val_loss, train_loss @ every VALIDATE_EVERY(10)
+                save_losses_history(train_loss.item(), loss.item())
 
         if i % GENERATE_EVERY == 0:
             model.eval()
