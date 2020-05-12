@@ -56,7 +56,9 @@ model = ReformerLM(
     weight_tie=True,
     causal=True,
     n_local_attn_heads=4,
-    use_full_attn=False  # set this to true for comparison with full attention
+    use_full_attn=False,  # set this to true for comparison with full attention,
+    # below seungbo
+    use_scale_norm=True
 )
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -119,7 +121,7 @@ def save_ckp(state, is_best, checkpoint_path, best_model_path):
 
 
 def save_losses_history(train_loss, val_loss):
-    f = open("/home/bizon/param_reformer/losses_history_0505_B1_without_clamp.txt", 'a')
+    f = open("/home/bizon/param_reformer/losses_history_model0509_C12.txt", 'a')
     f.write(f'train_loss: {train_loss}, val_loss:{val_loss}\n')
     f.close()
 
@@ -128,19 +130,19 @@ def save_losses_history(train_loss, val_loss):
 # NUM_BATCHES <- 이거걍 이폭으로봐라
 
 prev_best_loss = float('inf')
-checkpoint_path = "/home/bizon/param_reformer/model0505_B1_without_clamp.pth"
-best_model_path = "/home/bizon/param_reformer/best_model0505_B1_without_clamp.pth"
-save_loss_history_path  = "/home/bizon/param_reformer/losses_history_0505_B1_without_clamp.txt"
+checkpoint_path = "/home/bizon/param_reformer/model0509_C12.pth"
+best_model_path = "/home/bizon/param_reformer/best_model0509_C12.pth"
+save_loss_history_path  = "/home/bizon/param_reformer/losses_history_model0509_C12.txt"
 prev_best_loss_epoch = -1
 
-#
+
 # checkpoint = torch.load("/home/bizon/param_reformer/best_model0505_B1_without_clamp.pth")
 # model.load_state_dict(checkpoint['state_dict'])
 # optim.load_state_dict(checkpoint['optimizer'])
 # prev_best_loss_epoch = checkpoint['epoch']
 # prev_best_loss = checkpoint['valid_loss_min']
 # print(checkpoint.keys())
-print(f'best val loss was {prev_best_loss}, at epoch {prev_best_loss_epoch}')
+# print(f'best val loss was {prev_best_loss}, at epoch {prev_best_loss_epoch}')
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     if i <= prev_best_loss_epoch: continue
     model.train()  # 트레인전 세팅해주는겨

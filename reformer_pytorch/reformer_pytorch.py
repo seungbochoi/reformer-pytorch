@@ -19,14 +19,21 @@ TOKEN_SELF_ATTN_VALUE = -5e4  # carefully set for half precision to work
 def sort_key_val(t1, t2, dim=-1):
     # indices = sorted 가 어떻게됬는지 오리지널 오더 인덱스 로케이션도줌.
     values, indices = t1.sort(dim=dim)
-    t2 = t2.expand_as(t1)
-    return values, t2.gather(dim, indices)
+    t2 = t2.expand_as(t1)  # 우리경우는 아직 no change, useless so far..!
+    return values, t2.gather(dim, indices)  # values = sorted 된 buckets, t2.gather=인덱스 와이즈 소팅
+    # 우리 경우는 indices가 리턴됌
 
 
 def batched_index_select(values, indices):
     last_dim = values.shape[-1]
-    return values.gather(1, indices[:, :, None].expand(-1, -1, last_dim))
-
+    return values.gather(1, indices[:, :, None].expand(-1, -1, last_dim))  # X=[16,16384], X[:,:,None] = [16,16384,1] -> expand -> [16, 4*4096,64],
+    # [5,3,1] <- values, 근데 [3] 을 gather[1, [3*4]로 하는거니, broadcasting됌. // 얘네는 QK
+    # [5,3,1,  5,3,1,  5,3,1,  5,3,1] !!!
+    # [1,2,0,  0,1,2,  1,0,2,  2,1,0] <- expanded indices (n_hash round(4) 의 결과물)
+    # [3,1,5,  5,3,1,  3,5,1,  1,3,5] <- after gather
+# 결국, indices: bucket이 소팅된후 나오는, 이 bucket의 원래 자리!
+# 글머으로 그것에 해당되는 q의 tensor를 끄집어오는거야. (페이퍼의 Sort by LSH bucket부분)
+# 즉, 버켓 소팅할때 어떤놈을 끌고온지 기억해서, qk도 그대로 쏴주는거야.
 
 def process_inputs_chunk(fn, chunks=1, dim=0):
     def inner_fn(*args, **kwargs):
@@ -51,7 +58,7 @@ def default(val, default_val):
 
 
 def max_neg_value(tensor):
-    return -torch.finfo(tensor.dtype).max
+    return -torch.finfo(tensor.dtype).max  # tensor.dtype(float64)'s possible max number!, Largest representalbe number
 
 
 def cache_fn(f):
@@ -69,8 +76,8 @@ def cache_fn(f):
 
 
 def cache_method_decorator(cache_attr, cache_namespace, reexecute=False):
-    def inner_fn(fn):
-        @wraps(fn)
+    def inner_fn(fn):  # fn <- self.hash_vectors 통째로 들어옴
+        @wraps(fn)  # self.hash_vectors의 아규먼트들이 일로 들어온다
         def wrapper(self, *args, key_namespace=None, fetch=False, set_cache=True, **kwargs):
             namespace_str = str(default(key_namespace, ''))
             _cache = getattr(self, cache_attr)
@@ -81,8 +88,8 @@ def cache_method_decorator(cache_attr, cache_namespace, reexecute=False):
                 if reexecute:
                     fn(self, *args, **kwargs)
             else:
-                val = fn(self, *args, **kwargs)
-                if set_cache:
+                val = fn(self, *args, **kwargs)  # buckets 결과
+                if set_cache:  # self에다가 cache_attr 키로  이 뒷놈들을 저장해줌
                     setattr(self, cache_attr, {**_cache, **{_keyname: val}})
             return val
 
@@ -161,13 +168,15 @@ class ScaleNorm(nn.Module):
         # L2 norm !
 
         n = torch.norm(x, dim=-1, keepdim=True).clamp(min=self.eps)
+        # n = torch.sum(x, dim=-1, keepdim=True).clamp(min=self.eps)  # B1
 
-        return x / n * self.g # self.g 도 리턴해줘.
+        return x / n * self.g  # self.g 도 리턴해줘.
+
 
 class ScaleNormMatt(nn.Module):
-    def __init__(self, dim, g, eps=1e-5):
+    def __init__(self, g, dim, eps=1e-5):
         super().__init__()
-          # learnable parameter g 딱 하나 !
+        # learnable parameter g 딱 하나 !
         self.g = g
         self.eps = eps
 
@@ -180,9 +189,9 @@ class ScaleNormMatt(nn.Module):
 # X2 = X1 + F(SclaeNorm(X1)) ????? 이게아니라 걍 x2 = F(scaleNorm(x1))
 
 class PreNorm(nn.Module):
-    def __init__(self, norm_class, dim, fn):
+    def __init__(self, norm_class, g, dim, fn):
         super().__init__()
-        self.norm = norm_class(dim)
+        self.norm = norm_class(g, dim)
         self.fn = fn
 
     def forward(self, x, **kwargs):
@@ -213,6 +222,7 @@ class ChunkBeforeFF(nn.Module):
 
 class LSHAttention(nn.Module):
     def __init__(self,
+                 dot_constant_g,
                  dropout=0.,
                  bucket_size=64,
                  n_hashes=8,
@@ -226,6 +236,8 @@ class LSHAttention(nn.Module):
         super().__init__()
         if dropout >= 1.0:
             raise ValueError('Dropout rates must be lower than 1.')
+
+        self.dot_constant_g = dot_constant_g
 
         self.dropout = nn.Dropout(dropout)
         self.dropout_for_hash = nn.Dropout(drop_for_hash_rate)
@@ -386,43 +398,64 @@ class LSHAttention(nn.Module):
 
         # Hash-based sort ("s" at the start of variable names means "sorted")
         sbuckets_and_t, sticker = sort_key_val(buckets_and_t, ticker, dim=-1)
-        _, undo_sort = sort_key_val(sticker, ticker, dim=-1)
+        _, undo_sort = sort_key_val(sticker, ticker, dim=-1)  # undo_sort=sticker 를 re-sort해주고난후 나오는 원래자리값
+        # ex
+        # buckets_And_t = [3,1,2], ticker=[0,1,2]
+        # sbuckets_and_t = [1,2,3], sticker=[2,0,1]
+        # _ = [0,1,2], undo_sort = [1,2,0]
         del ticker
 
         sbuckets_and_t = sbuckets_and_t.detach()
         sticker = sticker.detach()
         undo_sort = undo_sort.detach()
-
-        st = (sticker % seqlen)
-        sqk = batched_index_select(qk, st)
+        # 원래 스케일로 맞춰줘요
+        st = (sticker % seqlen) # 4096 * ns + <positions>
+        sqk = batched_index_select(qk, st)  # 16, 16384, 64 ! qk소팅을 함! 4번한꼴임(Sort by LSH bucket 부분 그림에서)
         sv = batched_index_select(v, st)
 
         # Split off a "bin" axis so that attention only occurs within chunks.
-        chunk_size = total_hashes * n_buckets
-        bq_t = bkv_t = torch.reshape(st, (batch_size, chunk_size, -1))
-        bqk = torch.reshape(sqk, (batch_size, chunk_size, -1, dim))
-        bv = torch.reshape(sv, (batch_size, chunk_size, -1, dim))
+        chunk_size = total_hashes * n_buckets  # total_hashes = n_hash round number , 의미: 4096*4개를 버켓4*64단위로 쪼갬.
+        bq_t = bkv_t = torch.reshape(st, (batch_size, chunk_size, -1))  # 16,16384 -> 16,4*64,64 !! 즉 256개의 청크(64개갖고있는) 가 나옴 [한 청크가 버켓 64개 가지고있고, 각 버켓은 q로 되는데 q가 dim64니까, 16,256,64,64인거
+        bqk = torch.reshape(sqk, (batch_size, chunk_size, -1, dim))  # qk sorted by bucket !
+        bv = torch.reshape(sv, (batch_size, chunk_size, -1, dim))  # v sorted by bucket
 
         # Hashing operates on unit-length vectors. Unnormalized query vectors are
         # fine because they effectively provide a learnable temperature for the
         # attention softmax, but normalizing keys is needed so that similarity for
         # the purposes of attention correctly corresponds to hash locality.
-        bq = bqk
-        bk = F.normalize(bqk, p=2, dim=-1).type(bq.type())
+        bq = bqk  #            L2norm  dim= 64dim에 대해 노말라이즈
+        bk = F.normalize(bqk, p=2, dim=-1).type(bq.type())  # Normalized Q in paper(K_j = q/||q||
 
         # Allow each chunk to attend within itself, and also one chunk back. Chunk
         # boundaries might occur in the middle of a sequence of items from the
         # same bucket, so this increases the chances of attending to relevant items.
-        def look_one_back(x):
-            x_extra = torch.cat([x[:, -1:, ...], x[:, :-1, ...]], dim=1)
-            return torch.cat([x, x_extra], dim=2)
+        def look_one_back(x): # x(bv) = 16,256,64,64 -> 16,1,64,64
+            aaa = x[:, -1:, ...]  # bk: 16,256,64,64 -> 16,   1, 64, 64
+            bbb = x[:, :-1, ...]  # bk: 16,256,64,64 -> 16, 255, 64, 64
+            del aaa
+            del bbb
+            x_extra = torch.cat([x[:, -1:, ...], x[:, :-1, ...]], dim=1)  # bk : cat([16,1,64,64],[16,255,64,64],dim=1) -> [16,256,64,64] # 즉 맨마지막꺼를 앞으로 꺼내온다
+            return torch.cat([x, x_extra], dim=2)  # cat([16, 256, 64, 64], [16,256,64,64], dim=2) -> [16, 256, 64+64, 64]
 
-        bk = look_one_back(bk)
+        bk = look_one_back(bk)  # bk=16,256,64,64 ->
         bv = look_one_back(bv)
         bkv_t = look_one_back(bkv_t)
 
-        # Dot-product attention.
+        # Dot-product attention. bq=16,256,64,64
+        '''
+        bh ie = 16,256,   64,64 <- Q
+        bh je = 16,256,   128,64 <- K(Q/norm(Q))
+        bh ij = 16,256,   64,128 <- <Q,K>
+        '''
+        fake_bq = bq
+        bq = self.dot_constant_g.transpose(0,1)*bq
+
+        f = open("/home/bizon/param_reformer/losses_history_model0509_G_WEIGHT_C12.txt", 'a')
+        f.write(f'g weight: {self.dot_constant_g.transpose(0,1)}, Q: {fake_bq}, dotQ: {bq} \n')
+        f.close()
+
         dots = torch.einsum('bhie,bhje->bhij', bq, bk) * (dim ** -0.5)
+        # dots = [f1,f2,f3,., ...f_dim=64 or i] * dots
         masked_value = max_neg_value(dots)
 
         # Mask for post qk attention logits of the input sequence
@@ -437,21 +470,24 @@ class LSHAttention(nn.Module):
             dots.masked_fill_(~mask, masked_value)
             del mask
 
-        # Input mask for padding in variable lengthed sequences
+        # Input mask for padding in variable lengthed sequences.. 우리는 우선 안씀 ...
         if input_mask is not None:
-            input_mask = F.pad(input_mask, (0, seqlen - input_mask.shape[1]), value=True)
+            input_mask = F.pad(input_mask, (0, seqlen - input_mask.shape[1]), value=True)  # column 0=left padding, seqlen-input_mask.shape[1]=right padding
             mq = input_mask.gather(1, st).reshape((batch_size, chunk_size, -1))
             mkv = look_one_back(mq)
             mask = mq[:, :, :, None] * mkv[:, :, None, :]
             dots.masked_fill_(~mask, masked_value)
             del mask
 
-        # Causal masking
-        if self.causal:
-            mask = bq_t[:, :, :, None] < bkv_t[:, :, None, :]
+        # Causal masking  paper picture's last one(attend within same bucket in own chunk and previous chunk)
+        if self.causal:  # bq_t=[16 batch, 256 chunk, 64 buckets], bkv_t[16 batch, 256 chunk, 128 buckets]
+            bq_t_none = bq_t[:, :, :, None]  # [16, 256, 64, 1]
+            bks_t_none = bkv_t[:, :, None, :]  # [16, 256, 1, 128]  <- lookback해서 chunk두개합쳐짐
+            #  64갤아 128개를 비교함!
+            mask = bq_t[:, :, :, None] < bkv_t[:, :, None, :]  # [16, 256, 64, 128]
             if seqlen > query_len:
                 mask = mask & (bkv_t[:, :, None, :] < query_len)
-            dots.masked_fill_(mask, masked_value)
+            dots.masked_fill_(mask, masked_value)  # True(q's position < k's position) -> fill mask(-inf)
             del mask
 
         # Mask out attention to self except when no other targets are available.
@@ -463,7 +499,7 @@ class LSHAttention(nn.Module):
         if not self._attend_across_buckets:
             bq_buckets = bkv_buckets = torch.reshape(sbuckets_and_t // seqlen, (batch_size, chunk_size, -1))
             bkv_buckets = look_one_back(bkv_buckets)
-            bucket_mask = bq_buckets[:, :, :, None] != bkv_buckets[:, :, None, :]
+            bucket_mask = bq_buckets[:, :, :, None] != bkv_buckets[:, :, None, :]  # 다른 버켓이면 마스킹!(어텐션안구함)
             dots.masked_fill_(bucket_mask, masked_value)
             del bucket_mask
 
@@ -635,7 +671,8 @@ class FullQKAttention(nn.Module):
         t = query_len
 
         q = qk[:, 0:query_len]
-        qk = F.normalize(qk, 2, dim=-1).type(q.type())
+        # qk = F.normalize(qk, 2, dim=-1).type(q.type())
+        qk = F.normalize(qk, 1, dim=-1).type(q.type())
 
         dot = torch.einsum('bie,bje->bij', q, qk) * (dim ** -0.5)
 
@@ -671,7 +708,7 @@ class FullQKAttention(nn.Module):
 # Shared qk attention, using either full or LSH attention
 
 class LSHSelfAttention(nn.Module):
-    def __init__(self, dim, heads=8,
+    def __init__(self, g_dots_constant, dim, heads=8,
                  bucket_size=64, n_hashes=8,
                  causal=False, attn_chunks=1,
                  random_rotations_per_head=False,
@@ -697,7 +734,7 @@ class LSHSelfAttention(nn.Module):
 
         self.bucket_size = bucket_size
         # 이거씀..
-        self.lsh_attn = LSHAttention(bucket_size=bucket_size, n_hashes=n_hashes, causal=causal,
+        self.lsh_attn = LSHAttention(g_dots_constant, bucket_size=bucket_size, n_hashes=n_hashes, causal=causal,
                                      random_rotations_per_head=random_rotations_per_head,
                                      attend_across_buckets=attend_across_buckets,
                                      allow_duplicate_attention=allow_duplicate_attention,
@@ -717,6 +754,7 @@ class LSHSelfAttention(nn.Module):
 
         self.callback = None
 
+    # def forward(self, x, keys=None, input_mask=None, input_attn_mask=None, context_mask=None, **kwargs):
     def forward(self, x, keys=None, input_mask=None, input_attn_mask=None, context_mask=None, **kwargs):
         device, dtype = x.device, x.dtype
         # *는 리스트로 3개가 들어오나 ?? ㅇㅇ 맞네 4, 4096, 512
@@ -826,6 +864,18 @@ class FeedForward(nn.Module):
 
 
 # positional embeddings
+'''
+h   i i   m s  e  u  n  g  b  o ...
+
+token_emb 
+h -> [1] ->[256] -> *learnable param[256,512] -> [512] -> [4,4096, 512] -> [4,4,4096,512] ->[16, 4096,512]
+embbed token information 
+
+pos_emb
+h -> [1] -> (learnable param [4096 * 512] -> [512]     -> [4,4096, 512] -> [4,4,4096,512] -> [16, 4096,512]
+embed position information
+
+'''
 
 class AbsolutePositionalEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len):
@@ -910,7 +960,11 @@ class Reformer(nn.Module):
         self.twin_attention = twin_attention
         self.full_attn_thres = full_attn_thres
 
-        get_attn = lambda: LSHSelfAttention(dim, heads, bucket_size, n_hashes,
+        g = nn.Parameter(torch.ones(1))
+        g_dots_constant = torch.tensor([g.detach().numpy() ** i for i in range(64)], requires_grad=True, device="cuda:0")
+        norm_type = ScaleNormMatt if use_scale_norm else nn.LayerNorm  # 4, 4096,512 -> mean 은 4096,512 개의 민 구함g = nn.Parameter(torch.ones(1))
+
+        get_attn = lambda: LSHSelfAttention(g_dots_constant, dim, heads, bucket_size, n_hashes,
                                             causal=causal, dropout=lsh_dropout,
                                             post_attn_dropout=post_attn_dropout,
                                             attn_chunks=attn_chunks,
@@ -929,10 +983,9 @@ class Reformer(nn.Module):
         blocks = []
 
         # 배치놈은 4*4096 를 민구하는거야 - 비젼에서 Channel = nlp에서의 512벡터사이즈(model_dim)
-        norm_type = ScaleNorm if use_scale_norm else nn.LayerNorm  # 4, 4096,512 -> mean 은 4096,512 개의 민 구함
-        # norm_type = ScaleNormMatt if use_scale_norm else nn.LayerNorm  # 4, 4096,512 -> mean 은 4096,512 개의 민 구함
+        # norm_type = ScaleNorm if use_scale_norm else nn.LayerNorm  # 4, 4096,512 -> mean 은 4096,512 개의 민 구함
 
-        residual_fn_wrapper = ReZero if use_rezero else partial(PreNorm, norm_type, dim)
+        residual_fn_wrapper = ReZero if use_rezero else partial(PreNorm, norm_type, g, dim)
 
         for _ in range(depth):
             attn = get_attn()  # 캐시되있는 LSHSelfAttention() 가 계속 나옴. 걍 같은 파라미터 계속씀 웨이트 타이면!
@@ -977,6 +1030,7 @@ class ReformerLM(nn.Module):
 
         # look up table
         # 256 * 512
+        #  [4,4096,1] -> [4,4096,256] * token_emb[256, 512] -> X [4,4096,512]
         self.token_emb = nn.Embedding(num_tokens, emb_dim)
 
         # 임베딩매트릭스 초기값 이니셜라이제이션을 -0.01 ~ 0.01 안에서 쓸꺼다 (트레인할꺼임)
@@ -1021,7 +1075,6 @@ class ReformerLM(nn.Module):
     def forward(self, x, **kwargs):
         x = self.token_emb(x)
         x = x + self.pos_emb(x).type(x.type())  # x=float, pos_emb=torch float64 // 4096,512
-        pos_emb = self.pos_emb(x)
         x = self.to_model_dim(x)  # 4,4096,512
         x = self.reformer(x, **kwargs)
 
@@ -1031,6 +1084,7 @@ class ReformerLM(nn.Module):
         #                               ** 엔트로피=컴플렉시티 메져
         #                           -> over fitting
         #  그런데 weight_tie_embedding 파라미터가 증거하지않는다!
-        #       어케? 내가 각 이폭마다 트레인해줬던 look up table 을 디코더마냥 가져다가 쓸거다 #논문: Using the output Embedding to Improve Language Models
+        #       어케? 내가 각 이폭마다 트레인해줬던 look up table 을 디코더마냥 가져다가 쓸거다
+        #       #논문: Using the output Embedding to Improve Language Models
         aaa = self.out(x);
         return self.out(x)
